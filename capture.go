@@ -139,11 +139,22 @@ func printPort(mapFile string, port uint16) {
 
 }
 
+type process struct {
+	pid     int
+	cmdLine string
+}
+
+var processCache = map[uint16]process{}
+
 func findProcessFor(mapFile string, port uint16) (pid int, cmdLine string, err error) {
+	if process, ok := processCache[port]; ok {
+		return process.pid, process.cmdLine, nil
+	}
+
 	start := time.Now()
 	defer func() {
 		if pid != -1 {
-			fmt.Fprintf(os.Stderr, "took %s to find process for %d (%d: %q)\n", time.Since(start), port, pid, cmdLine)
+			fmt.Fprintf(os.Stderr, "  took %s to find process for %d\n", time.Since(start), port)
 		}
 	}()
 
@@ -215,6 +226,7 @@ func findProcessFor(mapFile string, port uint16) (pid int, cmdLine string, err e
 								if err != nil {
 									return -1, "", err
 								}
+								processCache[port] = process{pid: pid, cmdLine: string(data)}
 								return pid, string(data), nil
 							}
 						}
