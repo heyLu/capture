@@ -120,11 +120,6 @@ func main() {
 				}
 			}
 		}
-
-		/*fmt.Printf("pkt: %#v\n", packet)
-		if packet.NetworkLayer() != nil {
-			fmt.Printf("pkt network dst: %#v\n", packet.NetworkLayer().NetworkFlow().Dst())
-		}*/
 	}
 }
 func printPort(mapFile string, port uint16) {
