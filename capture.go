@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
 	"os"
 	"path"
 	"regexp"
@@ -26,6 +27,17 @@ var config struct {
 	iface string
 }
 
+type stat struct {
+	packetsRx int
+	packetsTx int
+	bytesRx   int
+	bytesTx   int
+}
+
+var stats = map[string]*stat{}
+
+var addrLookupCache = map[string]string{}
+
 func main() {
 	flag.StringVar(&config.file, "f", "", ".pcap file to read from")
 	flag.StringVar(&config.iface, "i", "lo", "interface to read from")
@@ -42,9 +54,13 @@ func main() {
 		log.Fatal("pcap open:", err)
 	}
 
+	c := 0
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	for packet := range packetSource.Packets() {
-		fmt.Println("--------------------------------------------------------------")
+		c++
+
+		w := len(strconv.Itoa(c))
+		fmt.Printf("%s%d\n", strings.Repeat("-", 60-w), c)
 
 		layerNames := make([]string, len(packet.Layers()))
 		for i, layer := range packet.Layers() {
@@ -52,13 +68,18 @@ func main() {
 		}
 		fmt.Println(layerNames)
 
+		var srcIP net.IP
+		var dstIP net.IP
+
 		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
 			ipv4, _ := ipv4Layer.(*layers.IPv4)
-			fmt.Printf("ipv4 (%s -> %s)\n", ipv4.SrcIP, ipv4.DstIP)
+			srcIP = ipv4.SrcIP
+			dstIP = ipv4.DstIP
 		}
 		if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
 			ipv6, _ := ipv6Layer.(*layers.IPv6)
-			fmt.Printf("ipv6 (%s -> %s)\n", ipv6.SrcIP, ipv6.DstIP)
+			srcIP = ipv6.SrcIP
+			dstIP = ipv6.DstIP
 		}
 		if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 			tcp, _ := tcpLayer.(*layers.TCP)
@@ -85,21 +106,70 @@ func main() {
 			default:
 				typ = "?"
 			}
-			fmt.Printf("tcp %s\n", typ)
-			if tcp.PSH {
-				fmt.Printf("  from src port %d to dst port %d\n", tcp.SrcPort, tcp.DstPort)
-				printPort("/proc/net/tcp", uint16(tcp.SrcPort))
-				printPort("/proc/net/tcp", uint16(tcp.DstPort))
+			fmt.Printf("tcp %s (%s:%d -> %s:%d)\n", typ, srcIP, tcp.SrcPort, dstIP, tcp.DstPort)
+			printPort("/proc/net/tcp", uint16(tcp.SrcPort))
+			printPort("/proc/net/tcp", uint16(tcp.DstPort))
+
+			if tcp.PSH || len(tcp.Payload) > 0 {
 				fmt.Printf("  payload (%d bytes)\n", len(tcp.Payload))
+			}
+
+			var remoteIP net.IP
+			var remotePort layers.TCPPort
+			var isRx bool
+			if tcp.SrcPort < tcp.DstPort {
+				isRx = true
+				remoteIP = srcIP
+				remotePort = tcp.SrcPort
+			} else {
+				remoteIP = dstIP
+				remotePort = tcp.DstPort
+				isRx = false
+			}
+			dst := fmt.Sprintf("%s:%d", remoteIP, remotePort)
+			if stats[dst] == nil {
+				stats[dst] = &stat{}
+			}
+			stat := stats[dst]
+			if isRx {
+				stat.packetsRx++
+				stat.bytesRx += len(tcp.Payload)
+			} else {
+				stat.packetsTx++
+				stat.bytesTx += len(tcp.Payload)
 			}
 		}
 
 		if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-			fmt.Println("udp")
 			udp, _ := udpLayer.(*layers.UDP)
-			fmt.Printf("  from src port %d to dst port %d\n", udp.SrcPort, udp.DstPort)
+			fmt.Printf("udp (%s:%d -> %s:%d)\n", srcIP, udp.SrcPort, dstIP, udp.DstPort)
 			printPort("/proc/net/udp", uint16(udp.SrcPort))
 			printPort("/proc/net/udp", uint16(udp.DstPort))
+
+			var remoteIP net.IP
+			var remotePort layers.UDPPort
+			var isRx bool
+			if udp.SrcPort < udp.DstPort {
+				isRx = true
+				remoteIP = srcIP
+				remotePort = udp.SrcPort
+			} else {
+				remoteIP = dstIP
+				remotePort = udp.DstPort
+				isRx = false
+			}
+			dst := fmt.Sprintf("%s:%d", remoteIP, remotePort)
+			if stats[dst] == nil {
+				stats[dst] = &stat{}
+			}
+			stat := stats[dst]
+			if isRx {
+				stat.packetsRx++
+				stat.bytesRx += len(udp.Payload)
+			} else {
+				stat.packetsTx++
+				stat.bytesTx += len(udp.Payload)
+			}
 		}
 
 		if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
@@ -120,6 +190,35 @@ func main() {
 				}
 			}
 		}
+
+		if c%100 == 0 {
+			fmt.Println("==========================================================")
+			for dst, stat := range stats {
+				name := dst
+				host, _, _ := net.SplitHostPort(dst)
+				if cachedName, ok := addrLookupCache[host]; ok {
+					if cachedName == "" {
+						name = dst
+					} else {
+						name = cachedName
+					}
+				} else {
+					names, _ := net.LookupAddr(host)
+					if len(names) > 0 {
+						name = names[0] + "(" + dst + ")"
+						addrLookupCache[host] = name
+					} else {
+						addrLookupCache[host] = ""
+					}
+				}
+				fmt.Printf("%s -> %#v\n", name, stat)
+			}
+		}
+	}
+
+	fmt.Println("==========================================================")
+	for dst, stat := range stats {
+		fmt.Printf("%s -> %#v\n", dst, stat)
 	}
 }
 func printPort(mapFile string, port uint16) {
