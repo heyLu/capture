@@ -2,16 +2,21 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/gopacket"
@@ -23,11 +28,13 @@ var localPortMin, localPortMax uint16 = 32768, 60999
 var pidRE = regexp.MustCompile(`^[0-9]+$`)
 
 var config struct {
+	addr  string
 	file  string
 	iface string
 }
 
 type stat struct {
+	mu        sync.Mutex
 	packetsRx int
 	packetsTx int
 	bytesRx   int
@@ -35,10 +42,15 @@ type stat struct {
 }
 
 var stats = map[string]*stat{}
+var totalStat = &stat{}
+var totalMu sync.Mutex
+var programStats = map[string]map[string]*stat{}
+var programMu sync.Mutex
 
 var addrLookupCache = map[string]string{}
 
 func main() {
+	flag.StringVar(&config.addr, "a", "localhost:1234", "address to listen on for ui")
 	flag.StringVar(&config.file, "f", "", ".pcap file to read from")
 	flag.StringVar(&config.iface, "i", "lo", "interface to read from")
 	flag.Parse()
@@ -53,6 +65,49 @@ func main() {
 	if err != nil {
 		log.Fatal("pcap open:", err)
 	}
+
+	go func() {
+		if config.file != "" {
+			return
+		}
+
+		log.Printf("Listening on http://%s", config.addr)
+		http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+			programMu.Lock()
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprintln(w, "total")
+			totalMu.Lock()
+			fmt.Fprintf(w, "  packets tx: %5d, packets rx: %5d, bytes tx: %6s, bytes rx: %6s\n",
+				totalStat.packetsTx, totalStat.packetsRx, prettyBytes(totalStat.bytesTx), prettyBytes(totalStat.bytesRx))
+			totalMu.Unlock()
+			fmt.Fprintln(w)
+
+			programs := make([]string, 0, len(programStats))
+			self := make([]string, 0, 1)
+			for program := range programStats {
+				if strings.Contains(program, os.Args[0]) {
+					self = append(self, program)
+					continue
+				}
+				programs = append(programs, program)
+			}
+			sort.Strings(programs)
+			for _, program := range programs {
+				stats := programStats[program]
+				fmt.Fprintf(w, "%s %s\n\n", program, strings.Repeat("=", 73-len(program)))
+				printStats(w, stats, false)
+				fmt.Fprintln(w)
+			}
+			for _, program := range self {
+				stats := programStats[program]
+				fmt.Fprintf(w, "%s %s\n\n", program, strings.Repeat("=", 73-len(program)))
+				printStats(w, stats, false)
+				fmt.Fprintln(w)
+			}
+			programMu.Unlock()
+		})
+		log.Fatal(http.ListenAndServe(config.addr, nil))
+	}()
 
 	c := 0
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
@@ -70,6 +125,7 @@ func main() {
 
 		var srcIP net.IP
 		var dstIP net.IP
+		var program string
 
 		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
 			ipv4, _ := ipv4Layer.(*layers.IPv4)
@@ -107,8 +163,11 @@ func main() {
 				typ = "?"
 			}
 			fmt.Printf("tcp %s (%s:%d -> %s:%d)\n", typ, srcIP, tcp.SrcPort, dstIP, tcp.DstPort)
-			printPort("/proc/net/tcp", uint16(tcp.SrcPort))
-			printPort("/proc/net/tcp", uint16(tcp.DstPort))
+			if tcp.SrcPort > tcp.DstPort {
+				program = printPort("/proc/net/tcp", uint16(tcp.SrcPort))
+			} else {
+				program = printPort("/proc/net/tcp", uint16(tcp.DstPort))
+			}
 
 			if tcp.PSH || len(tcp.Payload) > 0 {
 				fmt.Printf("  payload (%d bytes)\n", len(tcp.Payload))
@@ -127,24 +186,18 @@ func main() {
 				isRx = false
 			}
 			dst := fmt.Sprintf("%s:%d", remoteIP, remotePort)
-			if stats[dst] == nil {
-				stats[dst] = &stat{}
-			}
-			stat := stats[dst]
-			if isRx {
-				stat.packetsRx++
-				stat.bytesRx += len(tcp.Payload)
-			} else {
-				stat.packetsTx++
-				stat.bytesTx += len(tcp.Payload)
-			}
+			collectStats(stats, dst, isRx, len(tcp.Payload))
+			collectProgramStats(program, dst, isRx, len(tcp.Payload))
 		}
 
 		if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 			udp, _ := udpLayer.(*layers.UDP)
 			fmt.Printf("udp (%s:%d -> %s:%d)\n", srcIP, udp.SrcPort, dstIP, udp.DstPort)
-			printPort("/proc/net/udp", uint16(udp.SrcPort))
-			printPort("/proc/net/udp", uint16(udp.DstPort))
+			if udp.SrcPort > udp.DstPort {
+				program = printPort("/proc/net/udp", uint16(udp.SrcPort))
+			} else {
+				program = printPort("/proc/net/udp", uint16(udp.DstPort))
+			}
 
 			var remoteIP net.IP
 			var remotePort layers.UDPPort
@@ -159,17 +212,8 @@ func main() {
 				isRx = false
 			}
 			dst := fmt.Sprintf("%s:%d", remoteIP, remotePort)
-			if stats[dst] == nil {
-				stats[dst] = &stat{}
-			}
-			stat := stats[dst]
-			if isRx {
-				stat.packetsRx++
-				stat.bytesRx += len(udp.Payload)
-			} else {
-				stat.packetsTx++
-				stat.bytesTx += len(udp.Payload)
-			}
+			collectStats(stats, dst, isRx, len(udp.Payload))
+			collectProgramStats(program, dst, isRx, len(udp.Payload))
 		}
 
 		if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
@@ -193,44 +237,26 @@ func main() {
 
 		if c%100 == 0 {
 			fmt.Println("==========================================================")
-			for dst, stat := range stats {
-				name := dst
-				host, _, _ := net.SplitHostPort(dst)
-				if cachedName, ok := addrLookupCache[host]; ok {
-					if cachedName == "" {
-						name = dst
-					} else {
-						name = cachedName
-					}
-				} else {
-					names, _ := net.LookupAddr(host)
-					if len(names) > 0 {
-						name = names[0] + "(" + dst + ")"
-						addrLookupCache[host] = name
-					} else {
-						addrLookupCache[host] = ""
-					}
-				}
-				fmt.Printf("%s -> %#v\n", name, stat)
-			}
+			printStats(os.Stdout, stats, true)
 		}
 	}
 
 	fmt.Println("==========================================================")
-	for dst, stat := range stats {
-		fmt.Printf("%s -> %#v\n", dst, stat)
-	}
+	printStats(os.Stdout, stats, true)
 }
-func printPort(mapFile string, port uint16) {
+
+func printPort(mapFile string, port uint16) string {
 	if port >= localPortMin && port <= localPortMax {
 		pid, cmdLine, err := findProcessFor(mapFile, port)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  could not find process: %s\n", err)
-		} else {
-			fmt.Printf("  process: %d (%s)\n", pid, cmdLine)
+			return "unknown"
 		}
+		fmt.Printf("  process: %d (%s)\n", pid, cmdLine)
+		return cmdLine
 	}
 
+	return "unknown"
 }
 
 type process struct {
@@ -320,8 +346,10 @@ func findProcessFor(mapFile string, port uint16) (pid int, cmdLine string, err e
 								if err != nil {
 									return -1, "", err
 								}
-								processCache[port] = process{pid: pid, cmdLine: string(data)}
-								return pid, string(data), nil
+								cmdLine := string(data[:len(data)-1])
+								cmdLine = strings.Replace(cmdLine, "\x00", " ", -1)
+								processCache[port] = process{pid: pid, cmdLine: cmdLine}
+								return pid, cmdLine, nil
 							}
 						}
 					}
@@ -333,4 +361,137 @@ func findProcessFor(mapFile string, port uint16) (pid int, cmdLine string, err e
 		return -1, "", s.Err()
 	}
 	return -1, "", fmt.Errorf("process using port %d not found", port)
+}
+
+func collectStats(stats map[string]*stat, dst string, isRx bool, payloadLen int) {
+	if stats[dst] == nil {
+		stats[dst] = &stat{}
+	}
+	stat := stats[dst]
+	stat.mu.Lock()
+	totalMu.Lock()
+	if isRx {
+		stat.packetsRx++
+		stat.bytesRx += payloadLen
+		totalStat.packetsRx++
+		totalStat.bytesRx += payloadLen
+	} else {
+		stat.packetsTx++
+		stat.bytesTx += payloadLen
+		totalStat.packetsTx++
+		totalStat.bytesTx += payloadLen
+	}
+	totalMu.Unlock()
+	stat.mu.Unlock()
+}
+
+func collectProgramStats(program string, dst string, isRx bool, payloadLen int) {
+	programMu.Lock()
+	if programStats[program] == nil {
+		programStats[program] = map[string]*stat{}
+	}
+	collectStats(programStats[program], dst, isRx, payloadLen)
+	programMu.Unlock()
+}
+
+func printStats(w io.Writer, stats map[string]*stat, printTotal bool) {
+	if printTotal {
+		fmt.Fprintln(w, "total")
+		totalMu.Lock()
+		fmt.Fprintf(w, "  packets tx: %5d, packets rx: %5d, bytes tx: %6s, bytes rx: %6s\n",
+			totalStat.packetsTx, totalStat.packetsRx, prettyBytes(totalStat.bytesTx), prettyBytes(totalStat.bytesRx))
+		totalMu.Unlock()
+	}
+
+	dsts := make([]string, 0, len(stats))
+	for dst := range stats {
+		dsts = append(dsts, dst)
+	}
+	sort.Strings(dsts)
+	for _, dst := range dsts {
+		stat := stats[dst]
+		name := dst
+
+		if strings.HasSuffix(dst, ":443") {
+			httpsLookupMu.Lock()
+			httpsName, ok := httpsLookupCache[dst]
+			httpsLookupMu.Unlock()
+			if ok {
+				if httpsName != "" {
+					name = httpsName + " (" + dst + ")"
+				}
+			} else {
+				go func(dst string) {
+					httpsLookupMu.Lock()
+					if httpsLookupWait[dst] {
+						httpsLookupMu.Unlock()
+						return
+					}
+					httpsLookupWait[dst] = true
+					httpsLookupMu.Unlock()
+
+					addr := lookupViaHTTPS(dst)
+					httpsLookupMu.Lock()
+					httpsLookupCache[dst] = addr
+					httpsLookupMu.Unlock()
+				}(dst)
+			}
+		}
+
+		if name == dst {
+			host, _, _ := net.SplitHostPort(dst)
+			if cachedName, ok := addrLookupCache[host]; ok {
+				if cachedName == "" {
+					name = dst
+				} else {
+					name = cachedName + " (" + dst + ")"
+				}
+			} else {
+				names, _ := net.LookupAddr(host)
+				if len(names) > 0 {
+					name = names[0]
+					addrLookupCache[host] = name
+				} else {
+					addrLookupCache[host] = ""
+				}
+			}
+		}
+		fmt.Fprintln(w, name)
+		fmt.Fprintf(w, "  packets tx: %5d, packets rx: %5d, bytes tx: %6s, bytes rx: %6s\n",
+			stat.packetsTx, stat.packetsRx, prettyBytes(stat.bytesTx), prettyBytes(stat.bytesRx))
+	}
+}
+
+func prettyBytes(b int) string {
+	if b < 1024 {
+		return fmt.Sprintf("%d", b)
+	} else if b < 1024*1024 {
+		return fmt.Sprintf("%dkb", b/1024)
+	} else {
+		return fmt.Sprintf("%dmb", b/1024/1024)
+	}
+}
+
+var httpsLookupCache = map[string]string{}
+var httpsLookupWait = map[string]bool{}
+var httpsLookupMu sync.Mutex
+
+func lookupViaHTTPS(addr string) string {
+	// FIXME: use private transport
+	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	http.DefaultTransport.(*http.Transport).ResponseHeaderTimeout = 1 * time.Second
+	resp, err := http.Get("https://" + addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "could not lookup name via https: %s", err)
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.TLS != nil {
+		for _, cert := range resp.TLS.PeerCertificates {
+			if len(cert.DNSNames) > 0 {
+				return cert.DNSNames[0]
+			}
+		}
+	}
+	return ""
 }
