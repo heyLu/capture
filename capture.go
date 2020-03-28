@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -20,13 +21,22 @@ import (
 var localPortMin, localPortMax uint16 = 32768, 60999
 var pidRE = regexp.MustCompile(`^[0-9]+$`)
 
+var config struct {
+	file  string
+	iface string
+}
+
 func main() {
+	flag.StringVar(&config.file, "f", "", ".pcap file to read from")
+	flag.StringVar(&config.iface, "i", "lo", "interface to read from")
+	flag.Parse()
+
 	var handle *pcap.Handle
 	var err error
-	if len(os.Args) > 1 {
-		handle, err = pcap.OpenOffline(os.Args[1])
+	if config.file != "" {
+		handle, err = pcap.OpenOffline(config.file)
 	} else {
-		handle, err = pcap.OpenLive("lo", 1600, true, pcap.BlockForever)
+		handle, err = pcap.OpenLive(config.iface, 1600, true, pcap.BlockForever)
 	}
 	if err != nil {
 		log.Fatal("pcap open:", err)
