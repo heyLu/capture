@@ -187,7 +187,7 @@ func main() {
 			}
 			dst := fmt.Sprintf("%s:%d", remoteIP, remotePort)
 			collectStats(stats, dst, isRx, len(tcp.Payload))
-			collectProgramStats(program, dst, isRx, len(tcp.Payload))
+			collectProgramStats(program, dst, isRx, len(packet.Data()))
 		}
 
 		if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
