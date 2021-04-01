@@ -94,13 +94,13 @@ func main() {
 			sort.Strings(programs)
 			for _, program := range programs {
 				stats := programStats[program]
-				fmt.Fprintf(w, "%s %s\n\n", program, strings.Repeat("=", 73-len(program)))
+				fmt.Fprintf(w, "%s %s\n\n", program, strings.Repeat("=", max(0, 73-len(program))))
 				printStats(w, stats, false)
 				fmt.Fprintln(w)
 			}
 			for _, program := range self {
 				stats := programStats[program]
-				fmt.Fprintf(w, "%s %s\n\n", program, strings.Repeat("=", 73-len(program)))
+				fmt.Fprintf(w, "%s %s\n\n", program, strings.Repeat("=", max(0, 73-len(program))))
 				printStats(w, stats, false)
 				fmt.Fprintln(w)
 			}
@@ -460,6 +460,13 @@ func printStats(w io.Writer, stats map[string]*stat, printTotal bool) {
 		fmt.Fprintf(w, "  packets tx: %5d, packets rx: %5d, bytes tx: %6s, bytes rx: %6s\n",
 			stat.packetsTx, stat.packetsRx, prettyBytes(stat.bytesTx), prettyBytes(stat.bytesRx))
 	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func prettyBytes(b int) string {
